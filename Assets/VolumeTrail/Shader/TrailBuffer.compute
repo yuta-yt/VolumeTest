@@ -1,0 +1,87 @@
+﻿#pragma kernel CSTrailVert
+
+#define EPS 0.003 
+
+#include "SDFFunc.hlsl"
+#include "Packages/jp.keijiro.noiseshader/Shader/SimplexNoise3D.hlsl"
+
+StructuredBuffer<float3> _EmitterBuffer;
+RWStructuredBuffer<float3> _VerticesBuffer;
+
+RWTexture2D<float4> _PositionMap;
+
+int _TrailCount;
+
+float _Step;
+int _Segment;
+
+float3 _EmitDir;
+float3 _TargetPos;
+
+float _noiseScale;
+float3 _noiseOffset;
+
+float _Range;
+
+float3 GetSDFGradation(float3 positionInWorld)
+{
+    float2 e = float2(1.0, -1.0) * EPS;
+
+    return normalize(
+        e.xyy * GetSignedDistance(positionInWorld + e.xyy) + 
+        e.yxy * GetSignedDistance(positionInWorld + e.yxy) + 
+        e.yyx * GetSignedDistance(positionInWorld + e.yyx) + 
+        e.xxx * GetSignedDistance(positionInWorld + e.xxx) 
+    );
+}
+
+float3 GetNoiseGradation(float3 positionInWorld)
+{
+    float2 e = float2(1.0, -1.0) * EPS;
+
+    return normalize(
+        e.xyy * snoise(positionInWorld + e.xyy) + 
+        e.yxy * snoise(positionInWorld + e.yxy) + 
+        e.yyx * snoise(positionInWorld + e.yyx) + 
+        e.xxx * snoise(positionInWorld + e.xxx) 
+    );
+}
+
+float fit01(float m, float minim, float maxim)
+{
+    return (m - minim) / (maxim - minim);
+}
+
+[numthreads(8,1,1)]
+void CSTrailVert (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= _TrailCount) return;
+
+    int idx = id.x * _Segment;
+
+    float3 p = _EmitterBuffer[id.x];
+
+    _VerticesBuffer[idx] = p;
+    _PositionMap[float2(0, id.x)] = float4(p, 1);
+    float3 advect = p;
+    for(int i = 1; i < _Segment; i++)
+    {
+        float d = GetSignedDistance(advect);
+
+        float3 noiseGrad = GetNoiseGradation(advect * _noiseScale + _noiseOffset);
+        float3 dir = normalize(_EmitDir + noiseGrad * .35);
+
+        if(d <= _Range)
+        {
+            float3 sdfGrad = GetSDFGradation(advect);
+
+            float3 DFdir = normalize(cross(sdfGrad, noiseGrad));
+
+            dir = lerp(DFdir, dir, smoothstep(0, 1, fit01(abs(d), 0, _Range)));
+        }
+
+        advect += dir * _Step;
+        _VerticesBuffer[idx + i] = advect;
+        _PositionMap[float2(i, id.x)] = float4(advect, 1);
+    }
+}

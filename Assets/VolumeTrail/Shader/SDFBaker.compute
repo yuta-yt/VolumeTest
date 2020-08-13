@@ -1,0 +1,259 @@
+﻿#define THREADS 64
+#define INITIAL_DIST 1e10f
+#define GRID_MARGIN 15
+
+#pragma kernel InitSDF
+#pragma kernel BakeSDF
+#pragma kernel FinalizeSDF
+
+RWStructuredBuffer<uint> _SDFBuffer;
+
+float3 _gridSize;
+float3 _gridCenter;
+float3 _cellCount;
+float _cellSize;
+
+float4x4 _tW;
+
+StructuredBuffer<float3> _PositionBuffer;
+StructuredBuffer<int> _IndicesBuffer;
+
+// Bakeing SDF using ComputeShader from AMD TressFX : https://github.com/GPUOpen-Effects/TressFX/
+// Copyright (c) 2019 Advanced Micro Devices, Inc. All rights reserved.
+uint FloatFlip2(float fl)
+{
+    uint f = asuint(fl);
+    return (f << 1) | (f >> 31 ^ 0x00000001);		//Rotate sign bit to least significant and Flip sign bit so that (0 == negative)
+}
+
+uint IFloatFlip2(uint f2)
+{
+    return (f2 >> 1) | (f2 << 31 ^ 0x80000000);
+}
+
+uint FloatFlip3(float fl)
+{
+    uint f = asuint(fl);
+    return (f << 1) | (f >> 31);		//Rotate sign bit to least significant
+}
+
+uint IFloatFlip3(uint f2)
+{
+    return (f2 >> 1) | (f2 << 31);
+}
+
+// Get SDF cell index coordinates (x, y and z) from a point position in world space
+int3 GetSdfCoordinates(float3 positionInWorld)
+{
+    float3 sdfPosition = (positionInWorld - _gridCenter) / _cellSize;
+    
+    int3 result;
+    result.x = (int)sdfPosition.x;
+    result.y = (int)sdfPosition.y;
+    result.z = (int)sdfPosition.z;
+    
+    return result;
+}
+
+float3 GetSdfCellPosition(int3 gridPosition)
+{
+    float3 cellCenter = float3(gridPosition.x, gridPosition.y, gridPosition.z) * _cellSize;
+    cellCenter += _gridCenter.xyz;
+    
+    return cellCenter;
+}
+
+int GetSdfCellIndex(int3 gridPosition)
+{
+    int cellsPerLine = _cellCount.x;
+    int cellsPerPlane = _cellCount.x * _cellCount.y;
+
+    return cellsPerPlane*gridPosition.z + cellsPerLine*gridPosition.y + gridPosition.x;
+}
+
+float DistancePointToEdge(float3 p, float3 x0, float3 x1, out float3 n)
+{
+    float3 x10 = x1 - x0;
+
+    float t = dot(x1 - p, x10) / dot(x10, x10);
+    t = max(0.0f, min(t, 1.0f));
+
+    float3 a = p - (t*x0 + (1.0f - t)*x1);
+    float d = length(a);
+    n = a / (d + 1e-30f);
+
+    return d;
+}
+
+// from iq
+// http://www.iquilezles.org/www/articles/distfunctions/distfunctions.htm
+float dot2( float3 v ) { return dot(v,v); }
+float udTriangle( float3 p, float3 a, float3 b, float3 c )
+{
+  float3 ba = b - a; float3 pa = p - a;
+  float3 cb = c - b; float3 pb = p - b;
+  float3 ac = a - c; float3 pc = p - c;
+  float3 nor = cross( ba, ac );
+
+  return sqrt(
+    (sign(dot(cross(ba,nor),pa)) +
+     sign(dot(cross(cb,nor),pb)) +
+     sign(dot(cross(ac,nor),pc))<2.0)
+     ?
+     min( min(
+     dot2(ba*clamp(dot(ba,pa)/dot2(ba),0.0,1.0)-pa),
+     dot2(cb*clamp(dot(cb,pb)/dot2(cb),0.0,1.0)-pb) ),
+     dot2(ac*clamp(dot(ac,pc)/dot2(ac),0.0,1.0)-pc) )
+     :
+     dot(nor,pa)*dot(nor,pa)/dot2(nor) );
+}
+
+
+// Check if p is in the positive or negative side of triangle (x0, x1, x2)
+// Positive side is where the normal vector of triangle ( (x1-x0) x (x2-x0) ) is pointing to.
+float SignedDistancePointToTriangle(float3 p, float3 x0, float3 x1, float3 x2)
+{
+    float d = 0;
+    float3 x02 = x0 - x2;
+    float l0 = length(x02) + 1e-30f;
+    x02 = x02 / l0;
+    float3 x12 = x1 - x2;
+    float l1 = dot(x12, x02);
+    x12 = x12 - l1*x02;
+    float l2 = length(x12) + 1e-30f;
+    x12 = x12 / l2;
+    float3 px2 = p - x2;
+
+    float b = dot(x12, px2) / l2;
+    float a = (dot(x02, px2) - l1*b) / l0;
+    float c = 1 - a - b;
+
+    // normal vector of triangle. Don't need to normalize this yet.
+    float3 nTri = cross((x1 - x0), (x2 - x0));
+    float3 n;
+
+    float tol = 1e-8f;
+
+    if (a >= -tol && b >= -tol && c >= -tol)
+    {
+        n = p - (a*x0 + b*x1 + c*x2);
+        d = length(n);
+
+        float3 n1 = n / d;
+        float3 n2 = nTri / (length(nTri) + 1e-30f);		// if d == 0
+
+        n = (d > 0) ? n1 : n2;
+    }
+    else
+    {
+        float3 n_12;
+        float3 n_02;
+        d = DistancePointToEdge(p, x0, x1, n);
+
+        float d12 = DistancePointToEdge(p, x1, x2, n_12);
+        float d02 = DistancePointToEdge(p, x0, x2, n_02);
+
+        d = min(d, d12);
+        d = min(d, d02);
+
+        n = (d == d12) ? n_12 : n;
+        n = (d == d02) ? n_02 : n;
+    }
+
+    d = (dot(p - x0, nTri) < 0.f) ? -d : d;
+
+    return d;
+}
+
+// Check if p is in the positive or negative side of triangle (x0, x1, x2)
+// Positive side is where the normal vector of triangle ( (x1-x0) x (x2-x0) ) is pointing to.
+float SignedDistancePointToUDTriangle(float3 p, float3 x0, float3 x1, float3 x2)
+{
+    // normal vector of triangle. Don't need to normalize this yet.
+    float3 nTri = cross((x1 - x0), (x2 - x0));
+    float3 n;
+
+    float d = udTriangle(p, x0, x1, x2);
+
+    d = (dot(p - x0, nTri) < 0.f) ? -d : d;
+
+    return d;
+}
+
+[numthreads(THREADS,1,1)]
+void InitSDF (uint3 gid  : SV_GroupID,
+              uint3 gtid : SV_GroupThreadID,
+              uint3 dtid : SV_DispatchThreadID)
+{
+    uint cellIndex = dtid.x;
+
+    uint nCells = _cellCount.x*_cellCount.y*_cellCount.z;
+    if(cellIndex >= nCells) return;
+
+    _SDFBuffer[cellIndex] = FloatFlip3(INITIAL_DIST);
+}
+
+[numthreads(THREADS,1,1)]
+void BakeSDF (uint3 gid  : SV_GroupID,
+              uint3 gtid : SV_GroupThreadID,
+              uint3 dtid : SV_DispatchThreadID)
+{
+    int triIndex = dtid.x;
+
+    uint numIndices, dum;
+    _IndicesBuffer.GetDimensions(numIndices, dum);
+    uint numTriangles = numIndices / 3;
+
+    if(triIndex >= (int)numTriangles) return;
+
+    uint index0 = _IndicesBuffer[triIndex * 3 + 0];
+    uint index1 = _IndicesBuffer[triIndex * 3 + 1];
+    uint index2 = _IndicesBuffer[triIndex * 3 + 2];
+
+    float3 tri0 = mul(float4(_PositionBuffer[index0],1), _tW).xyz;
+    float3 tri1 = mul(float4(_PositionBuffer[index1],1), _tW).xyz;
+    float3 tri2 = mul(float4(_PositionBuffer[index2],1), _tW).xyz;
+
+    float3 aabbMin = min(tri0, min(tri1, tri2)) - _cellSize;
+    float3 aabbMax = max(tri0, max(tri1, tri2)) + _cellSize;
+
+    int3 gridMin = GetSdfCoordinates(aabbMin) - GRID_MARGIN;
+    int3 gridMax = GetSdfCoordinates(aabbMax) + GRID_MARGIN;
+
+    gridMin.x = max(0, min(gridMin.x, _cellCount.x - 1));
+    gridMin.y = max(0, min(gridMin.y, _cellCount.y - 1));
+    gridMin.z = max(0, min(gridMin.z, _cellCount.z - 1));
+
+    gridMax.x = max(0, min(gridMax.x, _cellCount.x - 1));
+    gridMax.y = max(0, min(gridMax.y, _cellCount.y - 1));
+    gridMax.z = max(0, min(gridMax.z, _cellCount.z - 1));
+
+    for(int z = gridMin.z; z <= gridMax.z; z++){
+        for(int y = gridMin.y; y <= gridMax.y; y++){
+            for(int x = gridMin.x; x <= gridMax.x; x++){
+                int3 gridCell = int3(x, y, z);
+                int gridCellIndex = GetSdfCellIndex(gridCell);
+                float3 cellPos  = GetSdfCellPosition(gridCell);
+
+                float dist = SignedDistancePointToUDTriangle(cellPos, tri0, tri1, tri2);
+
+                uint distAsUint = FloatFlip3(dist);
+                InterlockedMin(_SDFBuffer[gridCellIndex], distAsUint);
+            }
+        }
+    }
+}
+
+[numthreads(THREADS,1,1)]
+void FinalizeSDF (uint3 gid  : SV_GroupID,
+                  uint3 gtid : SV_GroupThreadID,
+                  uint3 dtid : SV_DispatchThreadID)
+{
+    uint cellIndex = dtid.x;
+
+    uint nCells = _cellCount.x*_cellCount.y*_cellCount.z;
+    if(cellIndex >= nCells) return;
+
+    uint dist = _SDFBuffer[cellIndex];
+    _SDFBuffer[cellIndex] = IFloatFlip3(dist);
+}
